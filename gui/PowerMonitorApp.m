@@ -1,21 +1,18 @@
 classdef PowerMonitorApp < handle
     %POWERMONITORAPP  USRP 를 등록하고 채널 맵에서 고른 20 MHz 채널의 수신 전력을 계속 보여 주는 창.
-    %   app = PowerMonitorApp                               빈 상태로 시작 (채널 맵을 클릭해 관찰)
-    %   app = PowerMonitorApp(Channels=36:4:64)             ch36~ch64 를 첫 USRP 로 관찰
-    %   app = PowerMonitorApp(Channels=36:4:64, Primary=40, Targets=[36 44], Gain=30)
+    %   app = PowerMonitorApp                      빈 상태로 시작 (채널 맵을 클릭해 관찰)
+    %   app = PowerMonitorApp(Channels=36:4:64)    ch36~ch64 를 첫 USRP 로 관찰하며 시작
     %
     %   USRP 표에서 기기를 고르고 채널 맵의 칸을 클릭하면 그 기기가 그 채널을 관찰한다.
-    %   다시 클릭하면 해제한다. '시작' 을 누르면 관찰 채널을 반복해서 훑는다.
-    %   송신 전에 '기준값 저장' 을 눌러 두면 이후에는 채널별 증가량(dB)이 함께 표시된다.
-    %   P20 과 타깃은 막대 색을 구분하는 표시일 뿐이며, 비워 두면 순수 관찰이 된다.
+    %   다시 클릭하면 해제한다. '클릭 단위' 를 40/80/160 MHz 로 두면 클릭한 칸이 속한
+    %   대역 전체를 한 번에 고른다. '시작' 을 누르면 관찰 채널을 반복해서 훑는다.
+    %   '기준값 저장' 을 눌러 두면 이후에는 채널별 증가량(dB)이 함께 표시된다.
     %   표시값은 최근 5바퀴의 중앙값이라 변화가 몇 초 늦게 반영된다.
     %   값은 보정 안 된 상대값(dBFS)이며 dBm 이 아니다.
 
     properties (SetAccess = private)
         Radios   table                  % 등록된 USRP (Name, Platform, SerialNum, LinkSpeed)
         Owner    (1,:) double           % 5 GHz 채널별로 관찰하는 USRP 번호. 0 이면 관찰 안 함
-        Primary  (1,1) double = 0       % P20 채널. 0 이면 없음
-        Targets  (1,:) double
         Levels   (:,2) double           % 채널별 표시 전력 [평균, 중앙값] (dBFS). 최근 몇 바퀴의 중앙값
         Baseline (:,2) double           % 저장한 기준값. 없으면 NaN
     end
@@ -35,8 +32,7 @@ classdef PowerMonitorApp < handle
 
         Fig
         RadioTable
-        PrimaryDrop
-        TargetField
+        WidthDrop
         GainField
         StatDrop
         StartButton
@@ -54,9 +50,7 @@ classdef PowerMonitorApp < handle
         SmoothSweeps = 5                % 표시값에 쓰는 최근 바퀴 수. 주변 Wi-Fi 트래픽이
                                         % 한두 바퀴 튀는 것을 걸러 낸다
         ClipDb       = -1               % 최대 샘플이 이보다 크면 포화로 본다
-        ColorPrimary = [0.30 0.69 0.31]
-        ColorTarget  = [0.90 0.30 0.25]
-        ColorIdle    = [0.70 0.70 0.70]
+        Widths       = [20 40 80 160]
         ColorUnused  = [0.90 0.90 0.90]
         ColorRadios  = [0.45 0.68 0.90; 0.97 0.72 0.35; 0.70 0.58 0.88; 0.45 0.80 0.75]
     end
@@ -66,15 +60,11 @@ classdef PowerMonitorApp < handle
         function obj = PowerMonitorApp(opts)
             arguments
                 opts.Channels (1,:) double = []
-                opts.Primary  (1,1) double = 0
-                opts.Targets  (1,:) double = []
                 opts.Gain     (1,1) double = 30
             end
             rootDir = fileparts(fileparts(mfilename("fullpath")));
             addpath(fullfile(rootDir, "device"), fullfile(rootDir, "measure"));
-            assert(all(ismember([opts.Channels, opts.Targets], obj.Channels5GHz)) && ...
-                ismember(opts.Primary, [0 obj.Channels5GHz]), ...
-                'SSOM:Channel', '5 GHz 20 MHz 채널 번호만 쓸 수 있습니다.');
+            assert(all(ismember(opts.Channels, obj.Channels5GHz)), 'SSOM:Channel', '5 GHz 20 MHz 채널 번호만 쓸 수 있습니다.');
 
             n = numel(obj.Channels5GHz);
             obj.Owner    = zeros(1, n);
@@ -82,8 +72,6 @@ classdef PowerMonitorApp < handle
             obj.Baseline = nan(n, 2);
             obj.Recent   = nan(n, 2, obj.SmoothSweeps);
             obj.PeakDb   = nan(n, 1);
-            obj.Primary  = opts.Primary;
-            obj.Targets  = opts.Targets;
             obj.buildUi(opts.Gain);
             obj.findRadios();
             if height(obj.Radios) > 0
@@ -132,28 +120,24 @@ classdef PowerMonitorApp < handle
             controls.ColumnWidth = {'1x', '1x', '1x', '1x'};
             controls.Padding = [0 0 0 0];
             controls.RowSpacing = 4;
-            titles = ["P20 (선택)", "타깃 채널 (선택)", "수신 Gain", ""];
+            titles = ["클릭 단위", "수신 Gain"];
             for k = 1:numel(titles)
                 label = uilabel(controls, 'Text', titles(k));
                 label.Layout.Row = 1;
                 label.Layout.Column = k;
             end
-            obj.PrimaryDrop = uidropdown(controls, 'Items', ["(없음)", "ch" + obj.Channels5GHz], ...
-                'ItemsData', [0 obj.Channels5GHz], 'Value', obj.Primary, ...
-                'ValueChangedFcn', @(~, ~) obj.onRolesChanged());
-            obj.TargetField = uieditfield(controls, 'text', 'Value', strtrim(sprintf('%d ', obj.Targets)), ...
-                'Tooltip', '올라가야 하는 채널 번호를 띄어 써서 입력 (예: 36 44). 비우면 구분 없이 관찰', ...
-                'ValueChangedFcn', @(~, ~) obj.onRolesChanged());
+            obj.WidthDrop = uidropdown(controls, 'Items', obj.Widths + " MHz", 'ItemsData', obj.Widths, ...
+                'Tooltip', '채널 맵을 한 번 클릭할 때 고르는 폭. 40 MHz 이상이면 클릭한 칸이 속한 대역 전체를 고른다.');
+            obj.WidthDrop.Layout.Row = 2;
+            obj.WidthDrop.Layout.Column = 1;
             obj.GainField = uispinner(controls, 'Limits', [0 76], 'Step', 5, 'Value', gain, ...
                 'ValueChangedFcn', @(~, ~) obj.onGainChanged());
+            obj.GainField.Layout.Row = 2;
+            obj.GainField.Layout.Column = 2;
             obj.StartButton = uibutton(controls, 'Text', '시작', 'FontWeight', 'bold', ...
                 'ButtonPushedFcn', @(~, ~) obj.onStartStop());
-            row = [obj.PrimaryDrop, obj.TargetField, obj.GainField, obj.StartButton];
-            for k = 1:numel(row)
-                item = row(k);
-                item.Layout.Row = 2;
-                item.Layout.Column = k;
-            end
+            obj.StartButton.Layout.Row = 2;
+            obj.StartButton.Layout.Column = 4;
             label = uilabel(controls, 'Text', "전력 계산");
             label.Layout.Row = 3;
             label.Layout.Column = [1 2];
@@ -162,7 +146,7 @@ classdef PowerMonitorApp < handle
             obj.StatDrop.Layout.Row = 4;
             obj.StatDrop.Layout.Column = [1 2];
             saveButton = uibutton(controls, 'Text', '기준값 저장', ...
-                'Tooltip', '송신 전 상태를 저장한다. 이후 채널별 증가량이 표시된다.', ...
+                'Tooltip', '지금 상태를 저장한다. 이후 채널별 증가량이 표시된다.', ...
                 'ButtonPushedFcn', @(~, ~) obj.onSaveBaseline());
             saveButton.Layout.Row = 4;
             saveButton.Layout.Column = 3;
@@ -179,7 +163,7 @@ classdef PowerMonitorApp < handle
             obj.LevelAxes = uiaxes(grid);
             obj.RiseAxes = uiaxes(grid);
             obj.Table = uitable(grid, 'ColumnName', ...
-                ["채널", "중심 주파수 (MHz)", "USRP", "구분", "현재 (dBFS)", "기준값 (dBFS)", "증가량 (dB)", "최대 샘플 (dBFS)"], ...
+                ["채널", "중심 주파수 (MHz)", "USRP", "현재 (dBFS)", "기준값 (dBFS)", "증가량 (dB)", "최대 샘플 (dBFS)"], ...
                 'RowName', {});
             obj.StatusLabel = uilabel(grid, 'Text', "채널 맵에서 관찰할 채널을 클릭하고 '시작' 을 누르세요.");
         end
@@ -259,20 +243,28 @@ classdef PowerMonitorApp < handle
 
         % ========== 채널 배정 함수 ==========
         function onMapClicked(obj, index)
-            % 고른 USRP 가 이미 보고 있는 칸이면 해제하고, 아니면 그 USRP 에 배정한다
+            % 클릭한 칸이 속한 대역(클릭 단위)을 고른 USRP 에 배정한다.
+            % 그 대역을 이미 그 USRP 가 모두 보고 있으면 해제한다.
             if isempty(obj.Radios)
                 obj.setStatus("등록된 USRP 가 없습니다. 연결한 뒤 '기기 새로고침' 을 누르세요.");
                 return
             end
-            if obj.Owner(index) == obj.Selected
-                obj.Owner(index) = 0;
-            else
-                obj.Owner(index) = obj.Selected;
+            try
+                block = bandChannels(obj.Channels5GHz(index), obj.WidthDrop.Value);
+            catch err
+                obj.setStatus(err.message);
+                return
             end
-            % 관찰하는 기기가 바뀌면 이전 측정값과 기준값은 비교할 수 없으므로 비운다
-            mask = false(size(obj.Owner));
-            mask(index) = true;
-            obj.clearChannels(mask);
+            mask = ismember(obj.Channels5GHz, block);
+            if all(obj.Owner(mask) == obj.Selected)
+                changed = mask;
+                obj.Owner(mask) = 0;
+            else
+                changed = mask & obj.Owner ~= obj.Selected;
+                obj.Owner(changed) = obj.Selected;
+            end
+            % 관찰하는 기기가 바뀐 채널은 이전 측정값과 기준값을 비교할 수 없으므로 비운다
+            obj.clearChannels(changed);
             obj.refresh();
         end
 
@@ -286,12 +278,6 @@ classdef PowerMonitorApp < handle
             end
         end
 
-        function onRolesChanged(obj)
-            obj.Primary = obj.PrimaryDrop.Value;
-            obj.Targets = unique(str2double(regexp(obj.TargetField.Value, '\d+', 'match')));
-            obj.refresh();
-        end
-
         function onGainChanged(obj)
             for k = 1:numel(obj.Scanners)
                 if ~isempty(obj.Scanners{k})
@@ -302,7 +288,7 @@ classdef PowerMonitorApp < handle
             % Gain 이 다르면 같은 신호도 다른 값으로 잡히므로 측정값과 기준값을 모두 비운다
             obj.clearChannels(true(size(obj.Owner)));
             if hadBaseline
-                obj.setStatus("Gain 을 바꿔 기준값을 지웠습니다. 송신 전 상태에서 다시 저장하세요.");
+                obj.setStatus("Gain 을 바꿔 기준값을 지웠습니다. 다시 저장하세요.");
             end
             obj.refresh();
         end
@@ -445,19 +431,6 @@ classdef PowerMonitorApp < handle
             obj.drawData();
         end
 
-        function [roles, colors] = roleOf(obj, channels)
-            % 채널별 구분 이름과 막대 색. P20 과 타깃을 정하지 않았으면 모두 빈 이름이다
-            n = numel(channels);
-            isPrimary = channels == obj.Primary;
-            isTarget = ismember(channels, obj.Targets) & ~isPrimary;
-            roles = repmat("", 1, n);
-            roles(isTarget) = "타깃";
-            roles(isPrimary) = "P20";
-            colors = repmat(obj.ColorIdle, n, 1);
-            colors(isTarget, :) = repmat(obj.ColorTarget, nnz(isTarget), 1);
-            colors(isPrimary, :) = repmat(obj.ColorPrimary, nnz(isPrimary), 1);
-        end
-
         function color = radioColor(obj, radio)
             color = obj.ColorRadios(mod(radio - 1, height(obj.ColorRadios)) + 1, :);
         end
@@ -487,7 +460,6 @@ classdef PowerMonitorApp < handle
             ax = obj.MapAxes;
             cla(ax);
             channels = obj.Channels5GHz;
-            roles = obj.roleOf(channels);
             % 주파수가 떨어진 구간(ch64-ch100, ch144-ch149) 사이는 칸을 띄운다
             left = (0:numel(channels) - 1) + 0.5 * cumsum([0, diff(channels) > 4]);
             for k = 1:numel(channels)
@@ -498,10 +470,8 @@ classdef PowerMonitorApp < handle
                 rectangle(ax, 'Position', [left(k), 0, 1, 1], 'FaceColor', color, 'EdgeColor', 'w', ...
                     'LineWidth', 2, 'ButtonDownFcn', @(~, ~) obj.onMapClicked(k));
                 % 글자가 클릭을 가로채지 않게 한다
-                text(ax, left(k) + 0.5, 0.66, string(channels(k)), 'HorizontalAlignment', 'center', ...
+                text(ax, left(k) + 0.5, 0.5, string(channels(k)), 'HorizontalAlignment', 'center', ...
                     'FontWeight', 'bold', 'PickableParts', 'none');
-                text(ax, left(k) + 0.5, 0.26, roles(k), 'HorizontalAlignment', 'center', ...
-                    'FontSize', 9, 'PickableParts', 'none');
             end
             xlim(ax, [0, left(end) + 1]);
             ylim(ax, [0 1]);
@@ -517,13 +487,15 @@ classdef PowerMonitorApp < handle
             base = obj.Baseline(shown, column);
             rise = level - base;
             hasBaseline = ~isnat(obj.BaselineTime);
-            [roles, colors] = obj.roleOf(channels);
+            colors = zeros(n, 3);   % 막대는 채널 맵과 같은 USRP 색
+            for k = 1:n
+                colors(k, :) = obj.radioColor(owner(shown(k)));
+            end
             if n > 12
                 ticks = string(channels);   % 칸이 좁으면 번호만 쓴다
             else
                 ticks = "ch" + channels;
             end
-            ticks(roles ~= "") = ticks(roles ~= "") + "\newline" + roles(roles ~= "");
 
             % 현재 전력 막대
             ax = obj.LevelAxes;
@@ -578,7 +550,7 @@ classdef PowerMonitorApp < handle
             end
             obj.styleAxes(ax, n, ticks, limits);
             if ~hasBaseline && n > 0
-                text(ax, mean(ax.XLim), mean(limits), "송신 전에 '기준값 저장' 을 누르면 증가량이 표시됩니다", ...
+                text(ax, mean(ax.XLim), mean(limits), "'기준값 저장' 을 누르면 그때 대비 증가량이 표시됩니다", ...
                     'HorizontalAlignment', 'center', 'Color', [0.4 0.4 0.4]);
             end
             ylabel(ax, '증가량 (dB)');
@@ -589,10 +561,10 @@ classdef PowerMonitorApp < handle
             end
 
             % 숫자 표
-            cells = cell(n, 8);
+            cells = cell(n, 7);
             for k = 1:n
                 cells(k, :) = {channels(k), 5000 + 5 * channels(k), ...
-                    char(obj.Radios.Name(owner(shown(k)))), char(roles(k)), ...
+                    char(obj.Radios.Name(owner(shown(k)))), ...
                     formatDb(level(k), '%.1f'), formatDb(base(k), '%.1f'), ...
                     formatDb(rise(k), '%+.1f'), formatDb(obj.PeakDb(shown(k)), '%.1f')};
             end
@@ -619,13 +591,9 @@ classdef PowerMonitorApp < handle
             if reopens > 0
                 message = message + sprintf(" · 유실로 다시 연 횟수 %d", reopens);
             end
-            watched = obj.Channels5GHz(obj.Owner > 0);
             clipped = obj.Channels5GHz(obj.Owner > 0 & obj.PeakDb' > obj.ClipDb);
-            missing = setdiff([obj.Targets, obj.Primary(obj.Primary > 0)], watched);
             if ~isempty(clipped)
                 message = message + " · 입력 포화 (ch" + join(string(clipped), ", ch") + "): Gain 을 낮추세요";
-            elseif ~isempty(missing)
-                message = message + " · ch" + join(string(missing), ", ch") + " 는 P20/타깃이지만 관찰하고 있지 않습니다";
             end
             obj.setStatus(message);
         end
