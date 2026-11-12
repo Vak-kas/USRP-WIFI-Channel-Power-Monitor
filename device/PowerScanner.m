@@ -2,9 +2,10 @@ classdef PowerScanner < handle
     %POWERSCANNER  B210 한 대를 열어 두고 20 MHz 채널의 수신 전력을 잰다 (수신 전용).
     %   scanner = PowerScanner                    연결된 USRP 를 자동으로 찾음
     %   scanner = PowerScanner(SerialNum="321D838", Gain=30)
+    %   scanner = PowerScanner(SerialNum="321D838", Platform="B210")   이미 찾은 기기는 탐색 생략
     %   power = scanner.measure(36)               ch36 의 전력 (channelPower 참고)
     %   PowerScanner.list()                       연결된 USRP 목록
-    %   PowerScanner.usbLinkSpeeds()              USRP 의 USB 링크 속도 (bit/s)
+    %   PowerScanner.usbLinks()                   USRP 별 USB 링크 속도 (bit/s)
     %
     %   수신기는 처음 잴 때 한 번만 열고(4~5초), 이후에는 중심 주파수만 바꾼다.
 
@@ -36,20 +37,26 @@ classdef PowerScanner < handle
         function obj = PowerScanner(opts)
             arguments
                 opts.SerialNum (1,1) string = ""
+                opts.Platform  (1,1) string = ""
                 opts.Gain      (1,1) double {mustBeInRange(opts.Gain, 0, 76)} = 30
                 opts.Duration  (1,1) duration = milliseconds(20)   % 채널 하나를 재는 길이
             end
-            found = PowerScanner.list();
-            found = found(found.Status == "Success", :);
-            assert(~isempty(found), 'SSOM:NoRadio', '연결된 USRP 를 찾지 못했습니다.');
-            if opts.SerialNum == ""
-                row = 1;
+            if opts.SerialNum ~= "" && opts.Platform ~= ""
+                obj.Platform  = opts.Platform;
+                obj.SerialNum = opts.SerialNum;
             else
-                row = find(found.SerialNum == opts.SerialNum, 1);
-                assert(~isempty(row), 'SSOM:NoRadio', '시리얼 %s 인 USRP 를 찾지 못했습니다.', opts.SerialNum);
+                found = PowerScanner.list();
+                found = found(found.Status == "Success", :);
+                assert(~isempty(found), 'SSOM:NoRadio', '연결된 USRP 를 찾지 못했습니다.');
+                if opts.SerialNum == ""
+                    row = 1;
+                else
+                    row = find(found.SerialNum == opts.SerialNum, 1);
+                    assert(~isempty(row), 'SSOM:NoRadio', '시리얼 %s 인 USRP 를 찾지 못했습니다.', opts.SerialNum);
+                end
+                obj.Platform  = found.Platform(row);
+                obj.SerialNum = found.SerialNum(row);
             end
-            obj.Platform  = found.Platform(row);
-            obj.SerialNum = found.SerialNum(row);
             obj.Gain      = opts.Gain;
             % 튜닝 직후 과도 구간인 첫 프레임은 버리므로 한 프레임 더 받는다
             obj.NumFrames = ceil(seconds(opts.Duration) * obj.SampleRate / obj.SamplesPerFrame) + 1;
@@ -151,11 +158,11 @@ classdef PowerScanner < handle
                 'VariableNames', ["Platform", "SerialNum", "Status"]);
         end
 
-        function speeds = usbLinkSpeeds()
-            %USBLINKSPEEDS  연결된 USRP 의 USB 링크 속도(bit/s). USB 3.0 이면 5e9.
+        function links = usbLinks()
+            %USBLINKS  연결된 USRP 의 시리얼과 USB 링크 속도(bit/s) 표. USB 3.0 이면 5e9.
             %   USB 2.0 허브를 거치면 480e6 이 되고 20 MS/s 에서 overflow 로 수신이 안 된다.
-            %   macOS 가 아니거나 장치를 못 찾으면 빈 값을 반환한다.
-            speeds = [];
+            %   macOS 가 아니거나 장치를 못 찾으면 빈 표를 반환한다.
+            links = table(strings(0, 1), zeros(0, 1), 'VariableNames', ["SerialNum", "LinkSpeed"]);
             if ~ismac
                 return
             end
@@ -168,9 +175,10 @@ classdef PowerScanner < handle
                 if isempty(regexp(devices{k}, sprintf('"idVendor" = %d\\s', PowerScanner.EttusVendorId), 'once'))
                     continue
                 end
-                token = regexp(devices{k}, '"UsbLinkSpeed" = (\d+)', 'tokens', 'once');
-                if ~isempty(token)
-                    speeds(end + 1) = str2double(token{1}); %#ok<AGROW>
+                speed = regexp(devices{k}, '"UsbLinkSpeed" = (\d+)', 'tokens', 'once');
+                serial = regexp(devices{k}, '"kUSBSerialNumberString" = "([^"]*)"', 'tokens', 'once');
+                if ~isempty(speed) && ~isempty(serial)
+                    links(end + 1, :) = {string(serial{1}), str2double(speed{1})}; %#ok<AGROW>
                 end
             end
         end
