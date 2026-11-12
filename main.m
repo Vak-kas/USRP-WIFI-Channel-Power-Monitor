@@ -9,4 +9,6 @@ rootDir = fileparts(mfilename("fullpath"));
 addpath(fullfile(rootDir, "device"), fullfile(rootDir, "measure"), fullfile(rootDir, "gui"));
 
 % 대상 AP: P20 = ch40, 160 MHz (ch36~ch64). 논문 타깃 q = ch36, r = ch44
-app = PowerMonitorApp(Primary=40, WidthMHz=160, Targets=[36 44], Gain=30);
+% 관찰 채널은 창의 채널 맵을 클릭해 바꿀 수 있다.
+% 구분 없이 빈 상태로 시작하려면: app = PowerMonitorApp;
+app = PowerMonitorApp(Channels=bandChannels(40, 160), Primary=40, Targets=[36 44], Gain=30);
