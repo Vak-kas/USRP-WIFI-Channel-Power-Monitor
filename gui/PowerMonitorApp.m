@@ -6,7 +6,8 @@ classdef PowerMonitorApp < handle
     %   USRP 표에서 기기를 고르고 채널 맵의 칸을 클릭하면 그 기기가 그 채널을 관찰한다.
     %   다시 클릭하면 해제한다. '클릭 단위' 를 40/80/160 MHz 로 두면 클릭한 칸이 속한
     %   대역 전체를 한 번에 고른다. '시작' 을 누르면 관찰 채널을 반복해서 훑는다.
-    %   '기준값 저장' 을 눌러 두면 이후에는 채널별 증가량(dB)이 함께 표시된다.
+    %   측정을 시작하고 값이 안정되면(8초쯤 뒤) 그때 값을 기준값으로 자동 저장하고,
+    %   이후에는 채널별 증가량(dB)을 함께 보여 준다. '기준값 저장' 으로 직접 다시 잡을 수 있다.
     %   표시값은 최근 5바퀴의 중앙값이라 변화가 몇 초 늦게 반영된다.
     %   값은 보정 안 된 상대값(dBFS)이며 dBm 이 아니다.
 
@@ -23,11 +24,15 @@ classdef PowerMonitorApp < handle
         Recent   (:,2,:) double         % 채널별 최근 몇 바퀴의 측정값
         PeakDb   (:,1) double
         BaselineTime = NaT
+        BaselineNote (1,1) string = ""  % 기준값을 어떻게 잡았는지 (그래프 제목에 표시)
+        SettleStart  (1,:) uint64       % 채널별로 자동 기준값의 안정화 대기를 시작한 시각 (tic)
+        Forced       (1,:) logical      % 흔들리는 채로 시간이 다 돼 자동 저장한 채널
         Sweeps   (1,1) double = 0
         SweepS   (1,1) double = NaN
         Running  (1,1) logical = false
         Busy     (1,1) logical = false
         Stale    (1,1) logical = false  % 측정 중에 설정이 바뀌어 화면을 다시 그려야 함
+        AutoCheck
         Closing  (1,1) logical = false
 
         Fig
@@ -50,6 +55,9 @@ classdef PowerMonitorApp < handle
         SmoothSweeps = 5                % 표시값에 쓰는 최근 바퀴 수. 주변 Wi-Fi 트래픽이
                                         % 한두 바퀴 튀는 것을 걸러 낸다
         ClipDb       = -1               % 최대 샘플이 이보다 크면 포화로 본다
+        SettleS        = 8              % 자동 기준값: 측정 시작이나 설정 변경 뒤 기다리는 시간
+        StableDb       = 2              % 자동 기준값: 최근 바퀴들이 이 폭 안에 들면 안정된 것으로 본다
+        SettleTimeoutS = 15             % 자동 기준값: 이 시간이 지나면 흔들려도 저장한다
         Widths       = [20 40 80 160]
         ColorUnused  = [0.90 0.90 0.90]
         ColorRadios  = [0.45 0.68 0.90; 0.97 0.72 0.35; 0.70 0.58 0.88; 0.45 0.80 0.75]
@@ -72,6 +80,8 @@ classdef PowerMonitorApp < handle
             obj.Baseline = nan(n, 2);
             obj.Recent   = nan(n, 2, obj.SmoothSweeps);
             obj.PeakDb   = nan(n, 1);
+            obj.SettleStart = repmat(tic, 1, n);
+            obj.Forced   = false(1, n);
             obj.buildUi(opts.Gain);
             obj.findRadios();
             if height(obj.Radios) > 0
@@ -138,6 +148,11 @@ classdef PowerMonitorApp < handle
                 'ButtonPushedFcn', @(~, ~) obj.onStartStop());
             obj.StartButton.Layout.Row = 2;
             obj.StartButton.Layout.Column = 4;
+            obj.AutoCheck = uicheckbox(controls, 'Text', '기준값 자동', 'Value', true, ...
+                'Tooltip', '기준값이 없는 채널은 값이 안정되면 자동으로 기준값을 저장한다.', ...
+                'ValueChangedFcn', @(~, ~) obj.restartSettle());
+            obj.AutoCheck.Layout.Row = 2;
+            obj.AutoCheck.Layout.Column = 3;
             label = uilabel(controls, 'Text', "전력 계산");
             label.Layout.Row = 3;
             label.Layout.Column = [1 2];
@@ -265,6 +280,7 @@ classdef PowerMonitorApp < handle
             end
             % 관찰하는 기기가 바뀐 채널은 이전 측정값과 기준값을 비교할 수 없으므로 비운다
             obj.clearChannels(changed);
+            obj.restartSettle(changed);
             obj.refresh();
         end
 
@@ -273,6 +289,7 @@ classdef PowerMonitorApp < handle
             obj.Baseline(mask, :) = NaN;
             obj.Recent(mask, :, :) = NaN;
             obj.PeakDb(mask) = NaN;
+            obj.Forced(mask) = false;
             if all(isnan(obj.Baseline), 'all')
                 obj.BaselineTime = NaT;
             end
@@ -287,6 +304,7 @@ classdef PowerMonitorApp < handle
             hadBaseline = ~isnat(obj.BaselineTime);
             % Gain 이 다르면 같은 신호도 다른 값으로 잡히므로 측정값과 기준값을 모두 비운다
             obj.clearChannels(true(size(obj.Owner)));
+            obj.restartSettle();
             if hadBaseline
                 obj.setStatus("Gain 을 바꿔 기준값을 지웠습니다. 다시 저장하세요.");
             end
@@ -308,6 +326,7 @@ classdef PowerMonitorApp < handle
             end
             obj.Running = true;
             obj.Busy = true;
+            obj.restartSettle();
             obj.StartButton.Text = '정지';
             try
                 obj.setStatus("수신기를 여는 중... (기기마다 4~5초)");
@@ -378,6 +397,7 @@ classdef PowerMonitorApp < handle
                         obj.Sweeps = obj.Sweeps + 1;
                         obj.SweepS = toc(started);
                     end
+                    obj.autoBaseline();
                     if ~obj.drawIfStale()
                         obj.drawData();
                     end
@@ -396,13 +416,55 @@ classdef PowerMonitorApp < handle
             obj.Baseline(:) = NaN;
             obj.Baseline(watched, :) = obj.Levels(watched, :);
             obj.BaselineTime = datetime("now");
+            obj.BaselineNote = "직접";
+            obj.Forced(:) = false;
             obj.refresh();
             obj.setStatus("지금 표시된 값을 기준값으로 저장했습니다.");
+        end
+
+        function autoBaseline(obj)
+            % 기준값이 없는 관찰 채널은 값이 안정되면 지금 표시값을 기준값으로 저장한다.
+            % 채널마다 따로 판단하고, 이미 기준값이 있는 채널은 건드리지 않는다.
+            need = obj.pendingBaseline();
+            if ~any(need)
+                return
+            end
+            waited = arrayfun(@toc, obj.SettleStart);
+            recent = obj.Recent(:, obj.StatDrop.Value, :);
+            measured = ~any(isnan(recent), 3)';
+            shaky = (max(recent, [], 3) - min(recent, [], 3))' > obj.StableDb;
+            % 주변 트래픽으로 흔들리는 채널은 가라앉기를 기다리되, 너무 오래 걸리면 그대로 저장한다
+            ready = need & measured & waited >= obj.SettleS & (~shaky | waited >= obj.SettleTimeoutS);
+            if ~any(ready)
+                return
+            end
+            obj.Baseline(ready, :) = obj.Levels(ready, :);
+            obj.Forced(ready) = shaky(ready);
+            obj.BaselineTime = datetime("now");
+            obj.BaselineNote = "자동";
+            if any(obj.Forced)
+                obj.BaselineNote = "자동, ch" + join(string(obj.Channels5GHz(obj.Forced)), "/ch") + " 는 흔들리는 중에 저장";
+            end
+            obj.Stale = true;
+        end
+
+        function need = pendingBaseline(obj)
+            % 자동 기준값을 기다리는 채널
+            need = obj.AutoCheck.Value & obj.Owner > 0 & any(isnan(obj.Baseline), 2)';
+        end
+
+        function restartSettle(obj, mask)
+            arguments
+                obj
+                mask (1,:) logical = true(size(obj.Owner))
+            end
+            obj.SettleStart(mask) = tic;
         end
 
         function onClearBaseline(obj)
             obj.Baseline(:) = NaN;
             obj.BaselineTime = NaT;
+            obj.restartSettle();   % 자동이 켜져 있으면 안정된 뒤 다시 잡는다
             obj.refresh();
         end
 
@@ -550,12 +612,13 @@ classdef PowerMonitorApp < handle
             end
             obj.styleAxes(ax, n, ticks, limits);
             if ~hasBaseline && n > 0
-                text(ax, mean(ax.XLim), mean(limits), "'기준값 저장' 을 누르면 그때 대비 증가량이 표시됩니다", ...
+                text(ax, mean(ax.XLim), mean(limits), "기준값이 저장되면 그때 대비 증가량이 표시됩니다", ...
                     'HorizontalAlignment', 'center', 'Color', [0.4 0.4 0.4]);
             end
             ylabel(ax, '증가량 (dB)');
             if hasBaseline
-                title(ax, sprintf('기준값 대비 증가량  (기준값 %s 저장)', string(obj.BaselineTime, "HH:mm:ss")));
+                title(ax, sprintf('기준값 대비 증가량  (기준값 %s 저장: %s)', ...
+                    string(obj.BaselineTime, "HH:mm:ss"), obj.BaselineNote));
             else
                 title(ax, '기준값 대비 증가량');
             end
@@ -587,6 +650,9 @@ classdef PowerMonitorApp < handle
 
         function showProgress(obj)
             message = sprintf("측정 중 · %d바퀴 · 한 바퀴 %.1f초", obj.Sweeps, obj.SweepS);
+            if any(obj.pendingBaseline())
+                message = message + " · 값이 안정되면 기준값을 자동 저장합니다";
+            end
             reopens = sum(cellfun(@(s) s.Reopens, obj.Scanners(~cellfun(@isempty, obj.Scanners))));
             if reopens > 0
                 message = message + sprintf(" · 유실로 다시 연 횟수 %d", reopens);
