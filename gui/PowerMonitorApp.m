@@ -10,6 +10,10 @@ classdef PowerMonitorApp < handle
     %   이후에는 채널별 증가량(dB)을 함께 보여 준다. '기준값 저장' 으로 직접 다시 잡을 수 있다.
     %   표시값은 최근 5바퀴의 중앙값이라 변화가 몇 초 늦게 반영된다.
     %   값은 보정 안 된 상대값(dBFS)이며 dBm 이 아니다.
+    %
+    %   아래 '실제 송신 대역폭 모니터' 에서 P20 채널을 고르면, 전력을 한 바퀴 잴 때마다
+    %   그 채널을 짧게 캡처해 다운링크 EHT PPDU 의 U-SIG 가 알리는 대역폭을 센다.
+    %   (WLAN Toolbox 필요. Wi-Fi 7 단말에 다운링크 트래픽이 흘러야 PPDU 가 잡힌다.)
 
     properties (SetAccess = private)
         Radios   table                  % 등록된 USRP (Name, Platform, SerialNum, LinkSpeed)
@@ -35,6 +39,11 @@ classdef PowerMonitorApp < handle
         AutoCheck
         Closing  (1,1) logical = false
 
+        UsigChannel (1,1) double = 0    % 송신 대역폭 모니터가 캡처하는 P20 채널. 0 이면 끔
+        UsigHistory = []                % 최근 PPDU (decodeUsig 표)
+        UsigTrend   (:,:) double        % [시각, 대역폭별 PPDU 수]
+        UsigStart   (1,1) uint64 = 0
+
         Fig
         RadioTable
         WidthDrop
@@ -45,6 +54,10 @@ classdef PowerMonitorApp < handle
         LevelAxes
         RiseAxes
         Table
+        UsigDrop
+        UsigLabel
+        UsigTable
+        UsigAxes
         StatusLabel
     end
 
@@ -59,6 +72,9 @@ classdef PowerMonitorApp < handle
         StableDb       = 2              % 자동 기준값: 최근 바퀴들이 이 폭 안에 들면 안정된 것으로 본다
         SettleTimeoutS = 15             % 자동 기준값: 이 시간이 지나면 흔들려도 저장한다
         Widths       = [20 40 80 160]
+        UsigBursts   = 4                % 송신 대역폭 모니터 한 번의 캡처 길이 (버스트 수, 약 0.1초)
+        UsigWindowS  = 60               % 추이 그래프에 남기는 시간
+        UsigRecentS  = 10               % 요약 표에 쓰는 최근 구간
         ColorUnused  = [0.90 0.90 0.90]
         ColorRadios  = [0.45 0.68 0.90; 0.97 0.72 0.35; 0.70 0.58 0.88; 0.45 0.80 0.75]
     end
@@ -71,7 +87,7 @@ classdef PowerMonitorApp < handle
                 opts.Gain     (1,1) double = 30
             end
             rootDir = fileparts(fileparts(mfilename("fullpath")));
-            addpath(fullfile(rootDir, "device"), fullfile(rootDir, "measure"));
+            addpath(fullfile(rootDir, "device"), fullfile(rootDir, "measure"), fullfile(rootDir, "monitor"));
             assert(all(ismember(opts.Channels, obj.Channels5GHz)), 'SSOM:Channel', '5 GHz 20 MHz 채널 번호만 쓸 수 있습니다.');
 
             n = numel(obj.Channels5GHz);
@@ -102,10 +118,10 @@ classdef PowerMonitorApp < handle
     methods (Access = private)
         % ========== 화면 구성 함수 ==========
         function buildUi(obj, gain)
-            obj.Fig = uifigure('Name', '5 GHz 채널별 수신 전력', 'Position', [100 40 1000 900], ...
+            obj.Fig = uifigure('Name', '5 GHz 채널 모니터', 'Position', [60 40 1240 900], ...
                 'CloseRequestFcn', @(~, ~) obj.onClose());
             grid = uigridlayout(obj.Fig, [6 1]);
-            grid.RowHeight = {120, 64, '1x', '1x', 215, 24};
+            grid.RowHeight = {120, 64, '1x', '1x', 240, 24};
 
             top = uigridlayout(grid, [1 2]);
             top.ColumnWidth = {'1x', 430};
@@ -177,9 +193,38 @@ classdef PowerMonitorApp < handle
             axis(obj.MapAxes, 'off');
             obj.LevelAxes = uiaxes(grid);
             obj.RiseAxes = uiaxes(grid);
-            obj.Table = uitable(grid, 'ColumnName', ...
-                ["채널", "중심 주파수 (MHz)", "USRP", "현재 (dBFS)", "기준값 (dBFS)", "증가량 (dB)", "최대 샘플 (dBFS)"], ...
-                'RowName', {});
+            bottom = uigridlayout(grid, [1 2]);
+            bottom.ColumnWidth = {'1x', 730};
+            bottom.Padding = [0 0 0 0];
+            obj.Table = uitable(bottom, 'ColumnName', ...
+                ["채널", "MHz", "USRP", "현재 dBFS", "기준 dBFS", "증가 dB", "최대 dBFS"], ...
+                'RowName', {}, 'ColumnWidth', {44, 52, 62, '1x', '1x', '1x', '1x'});
+
+            % --- 실제 송신 대역폭 모니터 ---
+            panel = uipanel(bottom, 'Title', '실제 송신 대역폭 모니터 (P20 의 U-SIG, 다운링크 EHT PPDU)');
+            usig = uigridlayout(panel, [2 3]);
+            usig.RowHeight = {24, '1x'};
+            usig.ColumnWidth = {130, 240, '1x'};
+            usig.Padding = [6 6 6 6];
+            obj.UsigDrop = uidropdown(usig, 'Items', ["끔", "P20 = ch" + obj.Channels5GHz], ...
+                'ItemsData', [0 obj.Channels5GHz], 'Value', 0, ...
+                'Tooltip', 'AP 의 P20 채널을 고르면 전력을 한 바퀴 잴 때마다 그 채널을 캡처해 U-SIG 를 푼다.', ...
+                'ValueChangedFcn', @(~, event) obj.onUsigChanged(event));
+            obj.UsigLabel = uilabel(usig, 'Text', "끔");
+            obj.UsigLabel.Layout.Row = 1;
+            obj.UsigLabel.Layout.Column = [2 3];
+            obj.UsigTable = uitable(usig, 'RowName', {}, ...
+                'ColumnName', ["Color", "폭(MHz)", "non-OFDMA", "Punct.", "PPDU", "비율(%)"], ...
+                'ColumnWidth', {48, 62, 86, 54, 50, 60});
+            obj.UsigTable.Layout.Row = 2;
+            obj.UsigTable.Layout.Column = [1 2];
+            obj.UsigAxes = uiaxes(usig);
+            obj.UsigAxes.Layout.Row = 2;
+            obj.UsigAxes.Layout.Column = 3;
+            obj.UsigAxes.Toolbar.Visible = 'off';
+            disableDefaultInteractivity(obj.UsigAxes);
+            xlabel(obj.UsigAxes, '시간 (s)');
+            ylabel(obj.UsigAxes, 'PPDU 수 / 갱신');
             obj.StatusLabel = uilabel(grid, 'Text', "채널 맵에서 관찰할 채널을 클릭하고 '시작' 을 누르세요.");
         end
 
@@ -317,7 +362,11 @@ classdef PowerMonitorApp < handle
                 obj.Running = false;   % 재고 있던 채널이 끝나면 멈춘다
                 return
             end
-            if ~any(obj.Owner > 0)
+            if isempty(obj.Radios)
+                obj.setStatus("등록된 USRP 가 없습니다. 연결한 뒤 '기기 새로고침' 을 누르세요.");
+                return
+            end
+            if ~any(obj.Owner > 0) && obj.UsigChannel == 0
                 obj.setStatus("관찰할 채널이 없습니다. USRP 를 고르고 채널 맵의 칸을 클릭하세요.");
                 return
             end
@@ -362,7 +411,7 @@ classdef PowerMonitorApp < handle
         function sweepLoop(obj)
             while obj.Running
                 order = find(obj.Owner > 0);
-                if isempty(order)
+                if isempty(order) && obj.UsigChannel == 0
                     % 측정 중에 채널을 모두 해제한 경우. 다시 고를 때까지 기다린다
                     obj.setStatus("관찰할 채널이 없습니다. 채널 맵의 칸을 클릭하세요.");
                     pause(0.2);
@@ -403,7 +452,89 @@ classdef PowerMonitorApp < handle
                     end
                     obj.showProgress();
                 end
+                if obj.Running && obj.UsigChannel > 0 && ~obj.usigStep()
+                    return
+                end
             end
+        end
+
+        % ========== 송신 대역폭 모니터 함수 ==========
+        function onUsigChanged(obj, event)
+            try
+                obj.UsigHistory = decodeUsig(zeros(0, 1), 20e6);   % 열 구성이 같은 빈 표
+            catch err
+                event.Source.Value = 0;
+                obj.UsigChannel = 0;
+                uialert(obj.Fig, "U-SIG 디코더를 쓸 수 없습니다 (WLAN Toolbox 필요): " + err.message, ...
+                    '송신 대역폭 모니터');
+                return
+            end
+            obj.UsigChannel = event.Value;
+            obj.UsigTrend = zeros(0, 1 + numel(obj.Widths));
+            obj.UsigStart = tic;
+            obj.refresh();
+        end
+
+        function radio = usigRadio(obj)
+            % P20 을 캡처할 USRP. 그 채널을 관찰하는 기기가 있으면 그 기기, 없으면 표에서 고른 기기
+            radio = obj.Owner(obj.Channels5GHz == obj.UsigChannel);
+            if isempty(radio) || radio == 0
+                radio = min(obj.Selected, height(obj.Radios));
+            end
+        end
+
+        function alive = usigStep(obj)
+            % P20 을 짧게 캡처해 다운링크 EHT PPDU 의 U-SIG 를 풀고 표와 추이 그래프에 더한다
+            channel = obj.UsigChannel;
+            waveforms = obj.scannerFor(obj.usigRadio()).capture(channel, obj.UsigBursts);
+            drawnow;   % 버튼 입력을 처리한다. 이때 모니터 채널이 바뀌거나 창이 닫힐 수 있다
+            alive = isvalid(obj);
+            if ~alive || ~obj.Running || obj.UsigChannel ~= channel
+                return
+            end
+            elapsed = toc(obj.UsigStart);
+            ppdus = obj.UsigHistory([], :);
+            for k = 1:numel(waveforms)
+                ppdus = [ppdus; decodeUsig(waveforms{k}, 20e6, EhtOnly=true)]; %#ok<AGROW>
+            end
+            ppdus = ppdus(~ppdus.Uplink, :);
+            ppdus.TimeS(:) = elapsed;
+            obj.UsigHistory = [obj.UsigHistory; ppdus];
+            obj.UsigHistory = obj.UsigHistory(obj.UsigHistory.TimeS > elapsed - obj.UsigRecentS, :);
+            obj.UsigTrend = [obj.UsigTrend; elapsed, sum(ppdus.BandwidthMHz == obj.Widths, 1)];
+            obj.UsigTrend = obj.UsigTrend(obj.UsigTrend(:, 1) > elapsed - obj.UsigWindowS, :);
+            obj.drawUsig();
+            if ~any(obj.Owner > 0)
+                obj.setStatus("송신 대역폭 모니터만 측정 중 (전력을 볼 채널은 채널 맵에서 클릭)");
+            end
+        end
+
+        function drawUsig(obj)
+            ax = obj.UsigAxes;
+            trend = obj.UsigTrend;
+            if obj.UsigChannel == 0 || isempty(trend)
+                obj.UsigTable.Data = {};
+                cla(ax);
+                legend(ax, 'off');
+                if obj.UsigChannel == 0
+                    obj.UsigLabel.Text = "끔";
+                else
+                    obj.UsigLabel.Text = sprintf("ch%d 측정 전. '시작' 을 누르면 함께 측정합니다.", obj.UsigChannel);
+                end
+                return
+            end
+            summary = summarizeUsig(obj.UsigHistory);
+            obj.UsigTable.Data = summary(:, ["BssColor", "BandwidthMHz", "NonOfdma", "PuncturedInfo", "Count", "SharePct"]);
+            obj.UsigLabel.Text = sprintf("ch%d 최근 %d초: 다운링크 EHT %d개 (갱신 주기 %.1f초)", ...
+                obj.UsigChannel, obj.UsigRecentS, height(obj.UsigHistory), mean(diff([0; trend(:, 1)])));
+            if isempty(obj.UsigHistory)
+                obj.UsigLabel.Text = obj.UsigLabel.Text + " / Wi-Fi 7 단말에 트래픽 필요";
+            end
+            bar(ax, trend(:, 1), trend(:, 2:end), 'stacked', 'BarWidth', 1);
+            legend(ax, obj.Widths + " MHz", 'Location', 'northeastoutside');
+            xlim(ax, [max(0, trend(end, 1) - obj.UsigWindowS), max(trend(end, 1), 10)]);
+            xlabel(ax, '시간 (s)');
+            ylabel(ax, 'PPDU 수 / 갱신');
         end
 
         % ========== 기준값 함수 ==========
@@ -491,6 +622,7 @@ classdef PowerMonitorApp < handle
             obj.drawRadios();
             obj.drawMap();
             obj.drawData();
+            obj.drawUsig();
         end
 
         function color = radioColor(obj, radio)
@@ -671,7 +803,11 @@ classdef PowerMonitorApp < handle
         % ========== 연결 확인 함수 ==========
         function ok = checkUsb(obj)
             % 관찰에 쓰는 USRP 가 USB 3.0 으로 연결돼 있는지 확인한다
-            used = unique(obj.Owner(obj.Owner > 0));
+            used = obj.Owner(obj.Owner > 0);
+            if obj.UsigChannel > 0
+                used(end + 1) = obj.usigRadio();
+            end
+            used = unique(used);
             slow = used(obj.Radios.LinkSpeed(used)' < PowerScanner.UsbSuperSpeed);
             ok = isempty(slow);
             if ~ok
