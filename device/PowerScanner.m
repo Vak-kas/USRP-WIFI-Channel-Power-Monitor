@@ -4,6 +4,7 @@ classdef PowerScanner < handle
     %   scanner = PowerScanner(SerialNum="321D838", Gain=30)
     %   scanner = PowerScanner(SerialNum="321D838", Platform="B210")   이미 찾은 기기는 탐색 생략
     %   power = scanner.measure(36)               ch36 의 전력 (channelPower 참고)
+    %   waveforms = scanner.capture(40, 4)        ch40 의 IQ 파형을 버스트 4개만큼 (약 0.1초)
     %   PowerScanner.list()                       연결된 USRP 목록
     %   PowerScanner.usbLinks()                   USRP 별 USB 링크 속도 (bit/s)
     %
@@ -68,26 +69,21 @@ classdef PowerScanner < handle
                 obj
                 channel (1,1) double {mustBeInteger, mustBePositive}
             end
-            centerFreqHz = (5000 + 5 * channel) * 1e6;
-            for attempt = 1:obj.MaxAttempts
-                try
-                    if isempty(obj.Rx)
-                        obj.open(centerFreqHz);
-                    end
-                    obj.Rx.CenterFrequency = centerFreqHz;
-                    raw = obj.readBurst();
-                    break
-                catch err
-                    % 유실 뒤 같은 객체로 계속 받으면 데이터가 어긋나므로 닫고 새로 연다
-                    obj.close();
-                    if attempt == obj.MaxAttempts || ~contains(err.message, "overflow", IgnoreCase=true)
-                        error('SSOM:CaptureFailed', 'ch%d 수신 실패 (%d회 시도): %s', ...
-                            channel, attempt, err.message);
-                    end
-                    obj.Reopens = obj.Reopens + 1;
-                end
+            bursts = obj.receive(channel, 1);
+            power = channelPower(bursts{1});
+        end
+
+        function waveforms = capture(obj, channel, numBursts)
+            %CAPTURE  채널 하나로 튜닝해 IQ 파형을 받는다 (PPDU 디코딩용).
+            %   버스트마다 따로 담은 셀 배열을 반환한다. 버스트 사이는 시간이 이어지지 않으므로
+            %   이어 붙이지 말고 하나씩 처리해야 한다. 값은 -1~1 로 정규화한 double 이다.
+            arguments
+                obj
+                channel   (1,1) double {mustBeInteger, mustBePositive}
+                numBursts (1,1) double {mustBeInteger, mustBePositive} = 1
             end
-            power = channelPower(raw(obj.SamplesPerFrame + 1:end));
+            bursts = obj.receive(channel, numBursts);
+            waveforms = cellfun(@(raw) double(raw) / 32768, bursts, 'UniformOutput', false);
         end
 
         function setGain(obj, gain)
@@ -126,6 +122,33 @@ classdef PowerScanner < handle
                 'OutputDataType', 'Same as transport data type', ...
                 'EnableBurstMode', true, ...        % 버스트 한 번에 연속 수신해 유실 방지
                 'NumFramesInBurst', obj.NumFrames);
+        end
+
+        function bursts = receive(obj, channel, numBursts)
+            % 채널로 튜닝해 버스트를 numBursts 개 받는다. 유실이 나면 수신기를 새로 열어 처음부터 다시 받는다.
+            centerFreqHz = (5000 + 5 * channel) * 1e6;
+            for attempt = 1:obj.MaxAttempts
+                try
+                    if isempty(obj.Rx)
+                        obj.open(centerFreqHz);
+                    end
+                    obj.Rx.CenterFrequency = centerFreqHz;
+                    bursts = cell(1, numBursts);
+                    for k = 1:numBursts
+                        bursts{k} = obj.readBurst();
+                    end
+                    break
+                catch err
+                    % 유실 뒤 같은 객체로 계속 받으면 데이터가 어긋나므로 닫고 새로 연다
+                    obj.close();
+                    if attempt == obj.MaxAttempts || ~contains(err.message, "overflow", IgnoreCase=true)
+                        error('SSOM:CaptureFailed', 'ch%d 수신 실패 (%d회 시도): %s', ...
+                            channel, attempt, err.message);
+                    end
+                    obj.Reopens = obj.Reopens + 1;
+                end
+            end
+            bursts{1} = bursts{1}(obj.SamplesPerFrame + 1:end);   % 튜닝 직후 첫 프레임은 버린다
         end
 
         function raw = readBurst(obj)
